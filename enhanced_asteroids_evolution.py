@@ -102,7 +102,7 @@ class Config:
     
     # Evolution
     population_size: int = 80
-    generations: int = 100
+    generations: int = 2000
     elite_size: int = 10
     mutation_rate: float = 0.15
     mutation_strength: float = 0.1
@@ -126,6 +126,12 @@ class Config:
     parallel_evaluation: bool = False
     num_workers: int = None
     
+    # GPU Settings
+    use_gpu: bool = True                  # Enable GPU acceleration
+    device: str = "auto"                  # "auto", "cuda", "mps", "cpu"
+    batch_evaluation: bool = False        # Batch multiple evaluations on GPU (conservative)
+    evaluation_batch_size: int = 4        # How many individuals to evaluate simultaneously
+    
     # Video recording
     video_frequency: int = 10
     video_episodes: int = 3
@@ -142,6 +148,79 @@ class Config:
             self.fc_layers = [512, 256]
         if self.num_workers is None:
             self.num_workers = min(mp.cpu_count() - 1, 6)
+        
+        # Auto-detect device safely
+        if self.device == "auto":
+            try:
+                if torch.cuda.is_available():
+                    # Test basic CUDA operations first
+                    test_device = torch.device("cuda")
+                    test_tensor = torch.randn(2, 2, device=test_device)
+                    _ = test_tensor @ test_tensor  # Simple test
+                    test_tensor.cpu()  # Clean up
+                    torch.cuda.empty_cache()
+                    
+                    self.device = "cuda"
+                    logger.info(f"🚀 GPU detected and tested: {torch.cuda.get_device_name()}")
+                elif torch.backends.mps.is_available():
+                    # Test MPS (Apple Silicon)
+                    test_device = torch.device("mps")
+                    test_tensor = torch.randn(2, 2, device=test_device)
+                    _ = test_tensor @ test_tensor
+                    test_tensor.cpu()
+                    
+                    self.device = "mps"
+                    logger.info(f"🍎 Apple Silicon GPU detected and tested")
+                else:
+                    self.device = "cpu"
+                    self.use_gpu = False
+                    logger.info(f"💻 Using CPU (no GPU available)")
+            except Exception as e:
+                logger.warning(f"⚠️  GPU test failed: {e}")
+                logger.info(f"💻 Falling back to CPU for stability")
+                self.device = "cpu"
+                self.use_gpu = False
+        
+        # Adjust settings for GPU
+        if self.use_gpu and self.device != "cpu":
+            # Conservative batch sizes for stability
+            if self.device == "cuda":
+                self.evaluation_batch_size = min(4, self.population_size // 10)  # Conservative
+            else:  # MPS (Apple Silicon)
+                self.evaluation_batch_size = min(2, self.population_size // 20)  # Very conservative
+            
+            logger.info(f"🎯 GPU batch size: {self.evaluation_batch_size}")
+        else:
+            self.evaluation_batch_size = 1
+
+
+def get_device(config: Config):
+    """Get the appropriate device for training with safe fallback"""
+    device = torch.device(config.device)
+    
+    if config.use_gpu and device.type != "cpu":
+        # Test GPU functionality safely
+        try:
+            # More comprehensive GPU test
+            test_tensor = torch.randn(100, 100).to(device)
+            result = test_tensor @ test_tensor  # Matrix multiplication test
+            result = torch.sum(result)  # Reduction test
+            result.cpu()  # Transfer back test
+            
+            # Clean up
+            del test_tensor, result
+            if device.type == "cuda":
+                torch.cuda.empty_cache()
+            
+            logger.info(f"✅ GPU test successful on {device}")
+            return device
+            
+        except Exception as e:
+            logger.warning(f"⚠️  GPU test failed: {e}")
+            logger.info(f"💻 Falling back to CPU for stability")
+            return torch.device("cpu")
+    
+    return device
 
 
 class GameStateExtractor:
@@ -436,12 +515,18 @@ class GameStateExtractor:
 
 
 class EnhancedAsteroidsNetwork(nn.Module):
-    """Enhanced network with both visual and game state features"""
+    """Enhanced network with both visual and game state features + GPU support"""
     
-    def __init__(self, config: Config):
+    def __init__(self, config: Config, device=None):
         super().__init__()
         self.config = config
         self.genome_id = str(uuid.uuid4())
+        
+        # Set device
+        if device is None:
+            self.device = get_device(config)
+        else:
+            self.device = device
         
         # Get action space size
         temp_env = create_env(config)
@@ -461,10 +546,14 @@ class EnhancedAsteroidsNetwork(nn.Module):
         self._build_network()
         self._initialize_weights()
         
+        # Move to device
+        self.to(self.device)
+        
         # Only log network details once per population
         if not hasattr(EnhancedAsteroidsNetwork, '_logged_network'):
             total_params = sum(p.numel() for p in self.parameters())
             logger.info(f"🧬 Enhanced network: {total_params:,} parameters, {self.n_actions} actions")
+            logger.info(f"📱 Device: {self.device}")
             EnhancedAsteroidsNetwork._logged_network = True
     
     def _build_network(self):
@@ -621,7 +710,9 @@ class EnhancedAsteroidsNetwork(nn.Module):
         """Process visual observation through CNN"""
         # Normalize and ensure correct shape
         if isinstance(obs, np.ndarray):
-            obs = torch.FloatTensor(obs)
+            obs = torch.FloatTensor(obs).to(self.device)
+        elif obs.device != self.device:
+            obs = obs.to(self.device)
         
         obs = obs.float() / 255.0
         
@@ -653,11 +744,16 @@ class EnhancedAsteroidsNetwork(nn.Module):
     def _process_gamestate_features(self, obs, info):
         """Process game state features through MLP"""
         try:
-            # Extract game state features from observation
-            game_features = self.feature_extractor.extract_features(obs, info)
+            # Extract game state features from observation (on CPU)
+            if isinstance(obs, torch.Tensor):
+                obs_cpu = obs.cpu().numpy()
+            else:
+                obs_cpu = obs
+                
+            game_features = self.feature_extractor.extract_features(obs_cpu, info)
             
-            # Convert to tensor and add batch dimension
-            game_features = torch.FloatTensor(game_features).unsqueeze(0)
+            # Convert to tensor and move to correct device
+            game_features = torch.FloatTensor(game_features).unsqueeze(0).to(self.device)
             
             # Process through MLP
             gamestate_out = self.gamestate_fc(game_features)
@@ -666,15 +762,16 @@ class EnhancedAsteroidsNetwork(nn.Module):
             
         except Exception as e:
             logger.debug(f"Game state feature extraction failed: {e}")
-            # Fallback: return zero features
-            return torch.zeros(1, 32)
+            # Fallback: return zero features on correct device
+            return torch.zeros(1, 32, device=self.device)
     
     def get_action(self, obs, info=None, deterministic=False, temperature=1.0):
-        """Get action with enhanced features"""
+        """Get action with enhanced features (GPU accelerated)"""
         with torch.no_grad():
             if isinstance(obs, np.ndarray):
                 obs = torch.FloatTensor(obs)
             
+            # Don't move to device here - let forward pass handle it
             logits = self.forward(obs, info)
             
             if deterministic:
@@ -686,20 +783,45 @@ class EnhancedAsteroidsNetwork(nn.Module):
                 action = torch.multinomial(probs, 1).item()
                 return action
     
+    def get_action_batch(self, obs_batch, info_batch=None, deterministic=False, temperature=1.0):
+        """Get actions for batch of observations (GPU optimized)"""
+        with torch.no_grad():
+            if isinstance(obs_batch, np.ndarray):
+                obs_batch = torch.FloatTensor(obs_batch)
+            
+            # Let forward pass handle device placement
+            logits_batch = self.forward(obs_batch, info_batch)
+            
+            if deterministic:
+                return torch.argmax(logits_batch, dim=-1).cpu().numpy()
+            else:
+                # Temperature-scaled sampling for batch
+                scaled_logits = logits_batch / temperature
+                probs_batch = torch.softmax(scaled_logits, dim=-1)
+                actions = torch.multinomial(probs_batch, 1).squeeze().cpu().numpy()
+                return actions
+    
     def mutate(self):
-        """Mutate network weights"""
+        """Mutate network weights (GPU safe)"""
         with torch.no_grad():
             for param in self.parameters():
                 if random.random() < self.config.mutation_rate:
-                    noise = torch.randn_like(param) * self.config.mutation_strength
-                    param.add_(noise)
+                    try:
+                        noise = torch.randn_like(param, device=param.device) * self.config.mutation_strength
+                        param.add_(noise)
+                    except Exception as e:
+                        # Fallback to CPU operation
+                        logger.debug(f"GPU mutation failed, using CPU: {e}")
+                        param_cpu = param.cpu()
+                        noise = torch.randn_like(param_cpu) * self.config.mutation_strength
+                        param.data = (param_cpu + noise).to(param.device)
         
         # Reset fitness and tracking
         self.fitness = 0.0
         self.episode_rewards = []
     
     def crossover(self, other):
-        """Create offspring via crossover"""
+        """Create offspring via crossover (GPU safe)"""
         offspring = copy.deepcopy(self)
         offspring.genome_id = str(uuid.uuid4())
         offspring.generation = max(self.generation, other.generation) + 1
@@ -711,9 +833,18 @@ class EnhancedAsteroidsNetwork(nn.Module):
                 offspring.parameters(), self.parameters(), other.parameters()
             ):
                 if random.random() < self.config.crossover_rate:
-                    # Uniform crossover
-                    mask = torch.rand_like(off_param) < 0.5
-                    off_param[mask] = p2_param[mask]
+                    try:
+                        # Uniform crossover on GPU
+                        mask = torch.rand_like(off_param, device=off_param.device) < 0.5
+                        off_param[mask] = p2_param[mask]
+                    except Exception as e:
+                        # Fallback to CPU operation
+                        logger.debug(f"GPU crossover failed, using CPU: {e}")
+                        off_cpu = off_param.cpu()
+                        p2_cpu = p2_param.cpu()
+                        mask = torch.rand_like(off_cpu) < 0.5
+                        off_cpu[mask] = p2_cpu[mask]
+                        off_param.data = off_cpu.to(off_param.device)
         
         return offspring
     
@@ -721,7 +852,20 @@ class EnhancedAsteroidsNetwork(nn.Module):
         """Create exact copy"""
         cloned = copy.deepcopy(self)
         cloned.genome_id = str(uuid.uuid4())
+        # Ensure cloned network is on same device
+        cloned.to(self.device)
         return cloned
+    
+    def to_cpu(self):
+        """Move network to CPU for serialization"""
+        cpu_copy = copy.deepcopy(self)
+        cpu_copy.device = torch.device("cpu")
+        return cpu_copy.cpu()
+    
+    def to_device(self, device):
+        """Move network to specific device"""
+        self.device = device
+        return self.to(device)
 
 
 def create_env(config: Config, seed=None, record_video=False, video_folder=None, episode_trigger=None):
@@ -761,16 +905,18 @@ def create_env(config: Config, seed=None, record_video=False, video_folder=None,
 
 
 def evaluate_individual(network_state, config, episodes, seed, genome_id):
-    """Evaluate individual with enhanced features"""
-    # Create network
-    network = EnhancedAsteroidsNetwork(config)
+    """Evaluate individual with enhanced features (CPU only for stability)"""
+    # Force CPU device for subprocess
+    device = torch.device("cpu")
+    network = EnhancedAsteroidsNetwork(config, device=device)
     network.load_state_dict(network_state)
     network.eval()
     
-    # Set seeds
+    # Set seeds (CPU only)
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
+    # Don't set CUDA seed to avoid CUDA errors
     
     # Create environment
     env = create_env(config, seed=seed)
@@ -827,6 +973,134 @@ def evaluate_individual(network_state, config, episodes, seed, genome_id):
     }
 
 
+def evaluate_batch_gpu(networks, config, episodes, seeds):
+    """GPU-accelerated batch evaluation (experimental)"""
+    if not config.use_gpu:
+        return None
+        
+    device = get_device(config)
+    if device.type == "cpu":
+        return None
+    
+    try:
+        # Move networks to GPU
+        gpu_networks = []
+        for network in networks:
+            gpu_net = copy.deepcopy(network).to(device)
+            gpu_net.eval()
+            gpu_networks.append(gpu_net)
+        
+        batch_results = []
+        
+        # Create environments (still need CPU environments)
+        envs = [create_env(config, seed=seed) for seed in seeds]
+        
+        # Batch evaluation loop
+        for episode in range(episodes):
+            observations = []
+            infos = []
+            
+            # Reset all environments
+            for i, env in enumerate(envs):
+                obs, info = env.reset(seed=seeds[i] + episode)
+                observations.append(obs)
+                infos.append(info)
+            
+            # Convert to batch tensors
+            obs_batch = torch.stack([torch.FloatTensor(obs) for obs in observations]).to(device)
+            
+            episode_rewards = [0.0] * len(envs)
+            episode_lengths = [0] * len(envs)
+            active_envs = list(range(len(envs)))
+            
+            for step in range(config.max_steps_per_episode):
+                if not active_envs:
+                    break
+                
+                # Get actions for all active environments
+                active_obs = obs_batch[active_envs]
+                active_networks = [gpu_networks[i] for i in active_envs]
+                
+                # Process batch through networks (simplified - would need more work)
+                actions = []
+                for i, net in enumerate(active_networks):
+                    action = net.get_action(active_obs[i], deterministic=False, temperature=1.2)
+                    actions.append(action)
+                
+                # Step environments
+                new_observations = []
+                completed_envs = []
+                
+                for i, env_idx in enumerate(active_envs):
+                    env = envs[env_idx]
+                    obs, reward, terminated, truncated, info = env.step(actions[i])
+                    
+                    episode_rewards[env_idx] += reward
+                    episode_lengths[env_idx] += 1
+                    
+                    if terminated or truncated:
+                        completed_envs.append(i)
+                    else:
+                        new_observations.append(obs)
+                
+                # Remove completed environments
+                for i in reversed(completed_envs):
+                    active_envs.pop(i)
+                
+                # Update observations
+                if new_observations:
+                    obs_batch = torch.stack([torch.FloatTensor(obs) for obs in new_observations]).to(device)
+            
+            # Store results for this episode
+            for i in range(len(envs)):
+                if episode == 0:
+                    batch_results.append({
+                        'episode_rewards': [episode_rewards[i]],
+                        'episode_lengths': [episode_lengths[i]]
+                    })
+                else:
+                    batch_results[i]['episode_rewards'].append(episode_rewards[i])
+                    batch_results[i]['episode_lengths'].append(episode_lengths[i])
+        
+        # Close environments
+        for env in envs:
+            env.close()
+        
+        # Calculate fitness for each network
+        results = []
+        for i, network in enumerate(networks):
+            episode_rewards = batch_results[i]['episode_rewards']
+            episode_lengths = batch_results[i]['episode_lengths']
+            
+            avg_reward = np.mean(episode_rewards)
+            avg_length = np.mean(episode_lengths)
+            consistency = 1.0 / (1.0 + np.std(episode_rewards))
+            
+            survival_bonus = min(avg_length / config.max_steps_per_episode * 100, 100)
+            performance_bonus = min(avg_reward / 1000 * 50, 50)
+            
+            fitness = (
+                avg_reward * 1.0 +
+                survival_bonus * 0.3 +
+                performance_bonus * 0.2 +
+                consistency * 15
+            )
+            
+            results.append({
+                'genome_id': network.genome_id,
+                'fitness': fitness,
+                'avg_reward': avg_reward,
+                'avg_length': avg_length,
+                'episode_rewards': episode_rewards
+            })
+        
+        return results
+        
+    except Exception as e:
+        logger.warning(f"GPU batch evaluation failed: {e}, falling back to CPU")
+        return None
+
+
 class EvolutionTrainer:
     """Enhanced evolution trainer"""
     
@@ -850,8 +1124,12 @@ class EvolutionTrainer:
         logger.info("Creating enhanced population with game state features...")
         self.population = []
         
+        # Get device for population
+        self.device = get_device(self.config)
+        logger.info(f"📱 Population device: {self.device}")
+        
         for i in range(self.config.population_size):
-            individual = EnhancedAsteroidsNetwork(self.config)
+            individual = EnhancedAsteroidsNetwork(self.config, device=self.device)
             individual.generation = 0
             self.population.append(individual)
         
@@ -863,13 +1141,51 @@ class EvolutionTrainer:
             logger.info(f"🎯 Features: Visual + {sample_features} game state → Enhanced AI")
     
     def evaluate_population(self):
-        """Evaluate entire population"""
+        """Evaluate entire population with GPU acceleration when possible"""
         logger.info(f"Evaluating generation {self.generation}")
         
-        if self.config.parallel_evaluation:
-            results = self._evaluate_parallel()
+        # Log GPU status
+        if self.config.use_gpu:
+            logger.info(f"🚀 GPU mode enabled, device: {self.device}")
         else:
-            results = self._evaluate_sequential()
+            logger.info(f"💻 CPU mode")
+        
+        # Try GPU batch evaluation first (experimental)
+        if self.config.use_gpu and self.config.batch_evaluation and hasattr(self, 'device') and self.device.type != "cpu":
+            logger.info(f"Attempting GPU batch evaluation...")
+            batch_size = self.config.evaluation_batch_size
+            batch_results = []
+            
+            for i in range(0, len(self.population), batch_size):
+                batch = self.population[i:i + batch_size]
+                seeds = [random.randint(0, 100000) for _ in batch]
+                
+                gpu_results = evaluate_batch_gpu(batch, self.config, self.config.episodes_per_eval, seeds)
+                
+                if gpu_results:
+                    batch_results.extend(gpu_results)
+                    if (i + len(batch)) % 25 == 0:
+                        logger.info(f"  GPU batch evaluated {i + len(batch)}/{len(self.population)} individuals")
+                else:
+                    logger.info(f"GPU batch evaluation failed, falling back to CPU for this batch")
+                    # Fallback to CPU evaluation for this batch
+                    for individual in batch:
+                        seed = random.randint(0, 100000)
+                        # Move to CPU for evaluation
+                        cpu_state = individual.to_cpu().state_dict()
+                        args = (cpu_state, self.config, self.config.episodes_per_eval, seed, individual.genome_id)
+                        result = evaluate_individual(*args)
+                        batch_results.append(result)
+            
+            results = batch_results
+        
+        # Fallback to standard evaluation
+        else:
+            logger.info(f"Using standard CPU evaluation")
+            if self.config.parallel_evaluation:
+                results = self._evaluate_parallel()
+            else:
+                results = self._evaluate_sequential()
         
         # Update fitness values
         for result in results:
@@ -898,13 +1214,32 @@ class EvolutionTrainer:
             logger.info(f"📈 Progress: +{improvement:.1f} points since start")
         
         return best_fitness, avg_fitness
+        
+        # Track statistics
+        fitnesses = [ind.fitness for ind in self.population]
+        best_fitness = max(fitnesses)
+        avg_fitness = np.mean(fitnesses)
+        
+        self.best_fitness_history.append(best_fitness)
+        self.avg_fitness_history.append(avg_fitness)
+        
+        logger.info(f"Gen {self.generation}: Best={best_fitness:.1f}, Avg={avg_fitness:.1f}")
+        
+        # Show progress every 10 generations
+        if self.generation % 10 == 0 and self.generation > 0:
+            improvement = best_fitness - self.best_fitness_history[0] if len(self.best_fitness_history) > 1 else 0
+            logger.info(f"📈 Progress: +{improvement:.1f} points since start")
+        
+        return best_fitness, avg_fitness
     
     def _evaluate_parallel(self):
-        """Parallel evaluation"""
+        """Parallel evaluation with CPU state dict conversion"""
         eval_args = []
         for individual in self.population:
+            # Convert to CPU state dict for multiprocessing
+            cpu_state = individual.to_cpu().state_dict() if hasattr(individual, 'to_cpu') else individual.state_dict()
             args = (
-                individual.state_dict(),
+                cpu_state,
                 self.config,
                 self.config.episodes_per_eval,
                 random.randint(0, 100000),
@@ -945,8 +1280,10 @@ class EvolutionTrainer:
         """Sequential evaluation for debugging"""
         results = []
         for i, individual in enumerate(self.population):
+            # Convert to CPU state dict
+            cpu_state = individual.to_cpu().state_dict() if hasattr(individual, 'to_cpu') else individual.state_dict()
             args = (
-                individual.state_dict(),
+                cpu_state,
                 self.config,
                 self.config.episodes_per_eval,
                 random.randint(0, 100000),
@@ -1118,7 +1455,8 @@ class EvolutionTrainer:
         self.avg_fitness_history = checkpoint['fitness_history']['avg']
         
         # Load best individual
-        best_network = EnhancedAsteroidsNetwork(self.config)
+        device = get_device(self.config)
+        best_network = EnhancedAsteroidsNetwork(self.config, device=device)
         best_network.load_state_dict(checkpoint['best_individual'])
         
         logger.info(f"✅ Checkpoint loaded:")
@@ -1130,11 +1468,14 @@ class EvolutionTrainer:
 
     def save_checkpoint(self, generation):
         """Save training checkpoint"""
+        # Save best individual state dict (move to CPU for serialization)
+        best_individual_state = self.population[0].to_cpu().state_dict() if hasattr(self.population[0], 'to_cpu') else self.population[0].state_dict()
+        
         checkpoint = {
             'generation': generation,
             'population_size': len(self.population),
             'best_fitness': self.best_fitness_history[-1] if self.best_fitness_history else 0,
-            'best_individual': self.population[0].state_dict(),
+            'best_individual': best_individual_state,
             'fitness_history': {
                 'best': self.best_fitness_history,
                 'avg': self.avg_fitness_history
@@ -1148,7 +1489,7 @@ class EvolutionTrainer:
         
         # Also save best model separately
         best_model_path = self.save_dir / "best_model.pt"
-        torch.save(self.population[0].state_dict(), best_model_path)
+        torch.save(best_individual_state, best_model_path)
         
         logger.info(f"Saved checkpoint to {checkpoint_path}")
     
@@ -1195,12 +1536,16 @@ class EvolutionTrainer:
         logger.info("🚀 Starting Enhanced Asteroids Neuroevolution Training")
         logger.info(f"Population: {self.config.population_size}, Generations: {self.config.generations}")
         
-        # Initialize
-        self.initialize_population()
+        # Initialize only if not resuming from checkpoint
+        if not hasattr(self, 'population') or len(self.population) == 0:
+            self.initialize_population()
         
         start_time = time.time()
+        start_generation = self.generation  # Track starting generation for resuming
+        print(f"Number of generations {self.config.generations}\n")
         
-        for generation in range(self.config.generations):
+        for generation in range(start_generation, self.config.generations):
+            self.generation = generation  # Update current generation
             gen_start = time.time()
             
             logger.info(f"🧬 Generation {generation + 1}/{self.config.generations}")
@@ -1316,7 +1661,7 @@ def compare_architectures():
 
 
 def main():
-    """Main function with enhanced features"""
+    """Main function with enhanced features and safe GPU support"""
     print("🚀 ENHANCED Asteroids Neuroevolution with Game State Features")
     print("=" * 70)
     
@@ -1328,12 +1673,12 @@ def main():
     # Show architecture comparison
     compare_architectures()
     
-    # Enhanced configuration
+    # Enhanced configuration with safe GPU support
     config = Config(
         population_size=80,
-        generations=100,
-        episodes_per_eval=3,
-        video_frequency=10,
+        generations=2000,
+        episodes_per_eval=10,
+        video_frequency=50,
         video_episodes=3,
         parallel_evaluation=False,  # Keep disabled for stability
         num_workers=4,
@@ -1341,6 +1686,11 @@ def main():
         use_visual_features=True,
         use_game_state_features=True,
         max_asteroids_tracked=5,
+        # GPU settings (re-enabled with safety)
+        use_gpu=True,               # Re-enable GPU with safety checks
+        device="auto",              # Auto-detect with fallback
+        batch_evaluation=False,     # Keep simple for now
+        evaluation_batch_size=4,    # Conservative batch size
         save_dir="enhanced_asteroids_evolution"
     )
     
@@ -1348,6 +1698,7 @@ def main():
     logger.info(f"  Population size: {config.population_size}")
     logger.info(f"  Generations: {config.generations}")
     logger.info(f"  Enhanced features: ENABLED")
+    logger.info(f"  GPU mode: {config.use_gpu} (with safety checks)")
     logger.info(f"  Expected improvement: 3-5x faster learning")
     
     # Create trainer and run
@@ -1360,14 +1711,14 @@ def main():
 
 
 def continue_training_from_checkpoint():
-    """Continue training from the latest checkpoint with enhanced features"""
+    """Continue training from the latest checkpoint with enhanced features and GPU"""
     print("🔄 Continuing Enhanced Asteroids Neuroevolution")
     print("=" * 60)
     
-    # Enhanced configuration for continued training
+    # Enhanced configuration for continued training (CPU only for stability)
     config = Config(
         population_size=80,
-        generations=200,  # Extended generations
+        generations=2000,  # Extended generations
         episodes_per_eval=3,
         video_frequency=10,
         video_episodes=3,
@@ -1377,6 +1728,11 @@ def continue_training_from_checkpoint():
         use_visual_features=True,
         use_game_state_features=True,
         max_asteroids_tracked=5,
+        # GPU settings (re-enabled with safety)
+        use_gpu=True,
+        device="auto",
+        batch_evaluation=False,
+        evaluation_batch_size=4,
         save_dir="enhanced_asteroids_evolution"
     )
     
@@ -1394,13 +1750,17 @@ def continue_training_from_checkpoint():
     
     # Create trainer and load checkpoint
     trainer = EvolutionTrainer(config)
-    trainer.load_checkpoint(latest_checkpoint)
     
-    # Initialize population (will be replaced by evolution)
+    # Load checkpoint BEFORE initializing population
+    best_network = trainer.load_checkpoint(latest_checkpoint)
+    
+    # Now initialize population (this will replace the loaded state anyway)
     trainer.initialize_population()
     
-    # Continue training
-    logger.info(f"Resuming enhanced training from generation {trainer.generation + 1}")
+    # Continue training from the loaded generation
+    logger.info(f"🔄 Resuming enhanced training from generation {trainer.generation + 1}")
+    logger.info(f"🏆 Previous best fitness: {trainer.best_fitness_history[-1]:.1f}")
+    
     best_individual = trainer.train()
     
     logger.info(f"🎉 Enhanced continued training complete!")
