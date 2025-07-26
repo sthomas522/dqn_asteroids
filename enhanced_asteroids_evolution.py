@@ -15,6 +15,7 @@ from gymnasium.wrappers import (
     RecordEpisodeStatistics,
     RecordVideo
 )
+from advanced_plateau_breaking import AdvancedEvolutionTrainer, AdvancedConfig
 
 # Try different FrameStack import paths for compatibility
 try:
@@ -1659,10 +1660,9 @@ def compare_architectures():
     logger.info("   ✅ More consistent performance")
     logger.info("   ✅ Strategic gameplay")
 
-
 def main():
-    """Main function with enhanced features and safe GPU support"""
-    print("🚀 ENHANCED Asteroids Neuroevolution with Game State Features")
+    """Main function with enhanced features and plateau-breaking"""
+    print("🚀 ENHANCED Asteroids Neuroevolution with Plateau-Breaking")
     print("=" * 70)
     
     # Test environment first
@@ -1673,41 +1673,37 @@ def main():
     # Show architecture comparison
     compare_architectures()
     
-    # Enhanced configuration with safe GPU support
+    # Use your EXISTING Config class (not AdvancedConfig)
     config = Config(
         population_size=80,
         generations=2000,
-        episodes_per_eval=10,
-        video_frequency=50,
+        episodes_per_eval=5,        # Increased for stability
+        video_frequency=25,         # Your existing parameter
         video_episodes=3,
-        parallel_evaluation=False,  # Keep disabled for stability
-        num_workers=4,
-        # Enhanced features
-        use_visual_features=True,
-        use_game_state_features=True,
-        max_asteroids_tracked=5,
-        # GPU settings (re-enabled with safety)
-        use_gpu=True,               # Re-enable GPU with safety checks
-        device="auto",              # Auto-detect with fallback
-        batch_evaluation=False,     # Keep simple for now
-        evaluation_batch_size=4,    # Conservative batch size
-        save_dir="enhanced_asteroids_evolution"
+        parallel_evaluation=False,
+        use_gpu=True,
+        device="auto",
+        save_dir="enhanced_asteroids_evolution_plateau_breaking"
     )
     
     logger.info(f"🎮 Enhanced Training Configuration:")
     logger.info(f"  Population size: {config.population_size}")
     logger.info(f"  Generations: {config.generations}")
-    logger.info(f"  Enhanced features: ENABLED")
-    logger.info(f"  GPU mode: {config.use_gpu} (with safety checks)")
-    logger.info(f"  Expected improvement: 3-5x faster learning")
+    logger.info(f"  Plateau-breaking: ENABLED")
     
-    # Create trainer and run
+    # Create your EXISTING trainer
     trainer = EvolutionTrainer(config)
+    
+    # ADD plateau-breaking (this is the magic line)
+    from easy_plateau_integration import add_plateau_breaking_to_trainer
+    EnhancedTrainer = add_plateau_breaking_to_trainer(EvolutionTrainer)
+    trainer = EnhancedTrainer(config)
+    
+    # Run training with plateau-breaking
     best_individual = trainer.train()
     
-    logger.info(f"🎉 Enhanced training complete!")
-    logger.info(f"📁 Results saved in: {config.save_dir}")
-    logger.info(f"🎬 Videos saved in: {config.save_dir}/videos")
+    logger.info(f"🎉 Training with plateau-breaking complete!")
+    return best_individual
 
 
 def continue_training_from_checkpoint():
@@ -1715,27 +1711,19 @@ def continue_training_from_checkpoint():
     print("🔄 Continuing Enhanced Asteroids Neuroevolution")
     print("=" * 60)
     
-    # Enhanced configuration for continued training (CPU only for stability)
-    config = Config(
+    config = AdvancedConfig(
         population_size=80,
-        generations=2000,  # Extended generations
-        episodes_per_eval=3,
-        video_frequency=10,
-        video_episodes=3,
-        parallel_evaluation=False,
-        num_workers=4,
-        # Enhanced features
-        use_visual_features=True,
-        use_game_state_features=True,
-        max_asteroids_tracked=5,
-        # GPU settings (re-enabled with safety)
+        generations=300,
+        enable_novelty_search=True,
+        enable_speciation=True,
+        plateau_detection_window=12,
+        max_mutation_rate=0.45,
         use_gpu=True,
         device="auto",
-        batch_evaluation=False,
-        evaluation_batch_size=4,
-        save_dir="enhanced_asteroids_evolution"
+        save_dir="enhanced_asteroids_evolution_v2"
     )
-    
+
+
     # Find latest checkpoint
     save_dir = Path(config.save_dir)
     checkpoints = list(save_dir.glob("checkpoint_gen_*.pkl"))
@@ -1749,8 +1737,9 @@ def continue_training_from_checkpoint():
     logger.info(f"Found latest checkpoint: {latest_checkpoint}")
     
     # Create trainer and load checkpoint
-    trainer = EvolutionTrainer(config)
-    
+    #trainer = EvolutionTrainer(config)
+    trainer = AdvancedEvolutionTrainer(config)
+
     # Load checkpoint BEFORE initializing population
     best_network = trainer.load_checkpoint(latest_checkpoint)
     
